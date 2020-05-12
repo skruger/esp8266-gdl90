@@ -2,6 +2,7 @@ import serial
 import struct
 import time
 import threading
+from queue import Queue
 
 CRLF = '\r\n'.encode()
 
@@ -11,6 +12,8 @@ class Reader:
         self.serial = esp
         self.ready = True
         self.exit = False
+        self.in_context = False
+        self.context_output_queue = Queue()
 
     def __call__(self, *args, **kwargs):
         while not self.exit and threading.main_thread().is_alive() and self.serial.is_open:
@@ -25,8 +28,20 @@ class Reader:
                 line = str(line_bytes)
 
             print(line)
+            if self.in_context:
+                self.context_output_queue.put(line)
+
             if line.startswith("OK") or line.startswith("ERROR"):
                 self.ready = True
+
+    def __enter__(self):
+        assert not self.in_context, "Reader context does not allow double entry!"
+        self.in_context = True
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.in_context = False
+        pass
 
 
 def read_lines(esp, timeout=10):
@@ -60,16 +75,44 @@ def main():
             pass
         print("Done")
 
-        reader.ready = False
-        esp.write('AT+CIPSTATUS\r\n'.encode())
-        while not reader.ready:
-            pass
+        ip_status = 0
 
-        print("Set station mode")
+        for delay in [0, .5, 1, 2, 4]:
+            if delay:
+                print(f"Trying to get status again in {delay}")
+                time.sleep(delay)
+            reader.ready = False
+            esp.write('AT+CIPSTATUS\r\n'.encode())
+            with reader:
+                while not reader.ready or not reader.context_output_queue.empty():
+                    line = reader.context_output_queue.get(block=True)
+                    if line.startswith("STATUS:"):
+                        ip_status = int(line.split(':')[1])
+                        print(f"Found ip status {ip_status}")
+
+            if ip_status == 2:
+                break
+
+        print("Check station mode")
         reader.ready = False
-        esp.write('AT+CWMODE_DEF=1\r\n'.encode())
-        while not reader.ready:
-            pass
+        esp.write('AT+CWMODE?\r\n'.encode())
+        wireless_mode = 0
+        with reader:
+            while not reader.ready or not reader.context_output_queue.empty():
+                line = reader.context_output_queue.get(block=True)
+                if line.startswith("+CWMODE:"):
+                    wireless_mode = int(line.split(':')[1])
+                    print(f"Found wireless mode {wireless_mode}")
+
+
+        time.sleep(.1)
+
+        if wireless_mode != 1:
+            print("Set station mode")
+            reader.ready = False
+            esp.write('AT+CWMODE_DEF=1\r\n'.encode())
+            while not reader.ready:
+                pass
 
         # print("Join access point")
         # reader.ready = False
